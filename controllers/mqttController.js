@@ -3,18 +3,18 @@ import Map from '../models/Map.js';
 import MapLive from '../models/LiveMap.js';
 import RobotPosition from '../models/robotPosition.js';
 import { convertMapToPGM, convertPGMtoPNG } from '../utils/mapUtils.js';
+import { getImage } from '../models/ImageModel.js';
+import client from '../config/mqttClient.js';
 
 let robotPosition = { x: 0, y: 0 };
+
 export const saveRobotIP = async (message) => {
   try {
-    // Diviser le message pour extraire l'IP et la version de ROS
     const [ip, rosVersion] = message.toString().split(' - ');
     console.log(`📡 Received IP: ${ip}, ROS Version: ${rosVersion}`);
 
-    // Vérifier si l'IP existe déjà dans la base de données
     const existingRobot = await Robot.findOne({ ip });
     if (!existingRobot) {
-      // Enregistrer l'IP et la version de ROS dans la base de données
       await new Robot({ ip, rosVersion }).save();
       console.log('✅ IP address and ROS version saved to MongoDB');
     } else {
@@ -93,48 +93,59 @@ export const saveFinalMap = async (message) => {
 };
 
 export const updateLiveMap = async (message) => {
-  const data = JSON.parse(message.toString());
+  try {
+    const data = JSON.parse(message.toString());
+    console.log('📡 Received live map data:', data); // Log pour vérifier les données reçues
 
-  if (!data.data || !Array.isArray(data.data) || data.data.length === 0) {
-    throw new Error('❌ Invalid live map data received: data is missing or empty');
-  }
+    if (!data.data || !Array.isArray(data.data) || data.data.length === 0) {
+      throw new Error('❌ Invalid live map data received: data is missing or empty');
+    }
 
-  console.log('📡 Received live map:', data.width, 'x', data.height);
-
-  await MapLive.findOneAndUpdate(
-    {},
-    {
-      data: data.data,
-      width: data.width,
-      height: data.height,
-      resolution: data.resolution,
-      origin: {
-        x: data.origin.x,
-        y: data.origin.y,
-        z: data.origin.z,
+    const mapData = {
+      info: {
+        width: data.width,
+        height: data.height,
+        resolution: data.resolution,
+        origin: data.origin,
       },
-    },
-    { upsert: true, new: true }
-  );
+      data: data.data,
+    };
 
-  console.log('✅ Live map updated in MongoDB');
+    console.log('📡 Map data before PGM conversion:', mapData); // Log pour vérifier les données avant conversion
 
-  const mapData = {
-    info: {
-      width: data.width,
-      height: data.height,
-      resolution: data.resolution,
-      origin: data.origin,
-    },
-    data: data.data,
-  };
+    // Mettre à jour la carte en temps réel dans MongoDB
+    await MapLive.findOneAndUpdate(
+      {},
+      {
+        data: data.data,
+        width: data.width,
+        height: data.height,
+        resolution: data.resolution,
+        origin: {
+          x: data.origin.x,
+          y: data.origin.y,
+          z: data.origin.z,
+        },
+      },
+      { upsert: true, new: true }
+    );
 
-  if (mapData.data && Array.isArray(mapData.data) && mapData.data.length > 0) {
-    convertMapToPGM(mapData, 'map_live.pgm', robotPosition);
-    convertPGMtoPNG('map_live.pgm', 'map_live.png');
-    console.log('✅ Live map converted to map_live.pgm and map_live.png');
-  } else {
-    console.error('❌ Live map data is empty, skipping PGM conversion');
+    console.log('✅ Live map updated in MongoDB');
+
+    // Convertir la carte en PGM et PNG
+    if (mapData.data && Array.isArray(mapData.data) && mapData.data.length > 0) {
+      console.log('📡 Converting map to PGM...');
+      convertMapToPGM(mapData, 'map_live.pgm', robotPosition);
+      console.log('✅ PGM conversion completed');
+
+      console.log('📡 Converting PGM to PNG...');
+      await convertPGMtoPNG('map_live.pgm', 'map_live.png');
+      console.log('✅ PNG conversion completed');
+    } else {
+      console.error('❌ Live map data is empty, skipping PGM conversion');
+    }
+  } catch (error) {
+    console.error('❌ Error updating live map:', error.message);
   }
 };
 
@@ -168,4 +179,15 @@ export const updateRobotPosition = async (message) => {
     },
     { upsert: true, new: true }
   );
+};
+export const handleNavGoal = async (message) => {
+  try {
+      const data = JSON.parse(message.toString());
+      console.log('Received navigation goal:', data);
+      // Logique pour traiter l'objectif de navigation
+      // Par exemple, vous pouvez ici transmettre les données à un autre système ou les logger
+  } catch (error) {
+      console.error('Error parsing nav_goal message:', error);
+      throw error;
+  }
 };

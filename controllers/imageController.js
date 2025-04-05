@@ -12,7 +12,7 @@ const uploadImage = async (req, res) => {
         }
 
         const originalPath = path.join(uploadDir, req.file.filename);
-        const newFileName = `${Date.now()}.png`;
+        const newFileName = `${Date.now()}`;
         const newFilePath = path.join(uploadDir, newFileName);
 
         await convertPGMtoPNG(originalPath, newFilePath);

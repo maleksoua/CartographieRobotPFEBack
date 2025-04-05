@@ -1,79 +1,188 @@
 import express from 'express';
 import bodyParser from 'body-parser';
 import { fileURLToPath } from 'url';
-import { dirname, join} from 'path';
+import { dirname, join } from 'path';
+import { createServer } from 'http';
 import fs from 'fs';
 import cors from 'cors';
-import connectDB from './config/database.js';
-import './Handlers/mqttHandler.js';
+import { WebSocketServer } from 'ws';
+import missionRoutes from './routes/missionRouters.js';
+import { connectDB } from './config/database.js';
 import robotRoutes from './routes/robotRoutes.js';
 import mapRoutes from './routes/mapRoutes.js';
 import moveRoutes from './routes/moveRoutes.js';
 import userRoutes from './routes/userRoutes.js';
 import slamRoutes from './routes/slamRoutes.js';
-import imageRoutes from './routes/imageRoutes.js'; 
+import imageRoutes from './routes/imageRoutes.js';
 import { setupMQTTHandlers } from './Handlers/mqttHandler.js';
+import { updateRobotStatus } from './controllers/robotController.js';
+import { convertMapToPGMMission, convertPGMtoPNGMission } from './utils/mapUtils.js';
 
-// Obtenir __dirname dans un module ES
+// Configuration des paths
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
 const uploadDir = 'uploads';
 
-// Ensure `uploads` directory exists
-if (!fs.existsSync(uploadDir)) {
-    fs.mkdirSync(uploadDir);
-}
-// Connexion à la base de données
-connectDB();
+// Variables globales pour l'état du système
+let currentMapData = null;
+let currentRobotPosition = { x: 0, y: 0 };
+let currentTrajectory = [];
+let activeMissions = new Map();
 
-// Configuration de l'application Express
+// Création du dossier uploads s'il n'existe pas
+if (!fs.existsSync(uploadDir)) {
+  fs.mkdirSync(uploadDir);
+}
+
+// Initialisation d'Express
 const app = express();
 const port = 3001;
+const server = createServer(app);
+const wss = new WebSocketServer({ server });
 
-app.use(express.json({ limit: '50mb' }));
-// Middleware CORS
-app.use(cors({
-  origin: ['http://localhost:8100', 'http://localhost:3001'], // Plusieurs origines autorisées
-  methods: ['GET', 'POST', 'PUT', 'DELETE'], // Méthodes HTTP autorisées
-  credentials: true, // Si vous utilisez des cookies ou des sessions
-}));
-// Configuration MQTT
-setupMQTTHandlers();
+// Configuration du serveur
+const startServer = async () => {
+  try {
+    await connectDB();
+    console.log('✅ Base de données connectée');
 
-// Middleware pour parser le corps des requêtes
-app.use(bodyParser.json());
+    // Middlewares
+    app.use(express.json({ limit: '50mb' }));
+    app.use(cors({
+      origin: ['http://localhost:8100', 'http://localhost:3001', 'ws://localhost:3001'],
+      methods: ['GET', 'POST', 'PUT', 'DELETE'],
+      credentials: true,
+    }));
+    app.use(bodyParser.json());
+    app.use(express.static(join(__dirname)));
 
-// Servir les fichiers statiques
-app.use(express.static(join(__dirname)));
+    // Initialisation MQTT avec WebSocket
+    console.log('🚀 Configuration des handlers MQTT');
+    setupMQTTHandlers(wss);
 
-// Endpoint pour servir l'image PNG
-app.get('/map_live.png', (req, res) => {
-  const filePath = join(__dirname, 'map_live.png');
-  
-  // Vérifier si le fichier existe
-  if (fs.existsSync(filePath)) {
-    res.sendFile(filePath);
-  } else {
-    res.status(404).json({ message: 'File not found' });
+    // Gestion des connexions WebSocket
+    wss.on('connection', (ws) => {
+      console.log('✅ Nouveau client WebSocket connecté');
+      
+      ws.on('message', async (message) => {
+        try {
+          const data = JSON.parse(message);
+          
+          if (data.type === 'trajectory_update') {
+            console.log('📩 Trajectoire reçue:', data.trajectory);
+            currentTrajectory = data.trajectory;
+            
+            // Mettre à jour la carte avec la nouvelle trajectoire
+            if (currentMapData) {
+              await updateMapWithTrajectory(currentMapData, currentRobotPosition, currentTrajectory);
+              
+              // Envoyer la mise à jour à tous les clients
+              broadcastMapUpdate();
+            }
+          }
+          
+          // Autres types de messages WebSocket...
+          if (data.type === 'request_map_update') {
+            broadcastMapUpdate();
+          }
+          
+        } catch (error) {
+          console.error('❌ Erreur traitement message WebSocket:', error);
+        }
+      });
+
+      ws.on('close', () => {
+        console.log('ℹ️ Client WebSocket déconnecté');
+      });
+    });
+
+    // Routes
+    app.use('/api/user', userRoutes);
+    app.use('/api/robot', robotRoutes);
+    app.use('/api/map', mapRoutes);
+    app.use('/api', moveRoutes);
+    app.use('/api', slamRoutes);
+    app.use('', imageRoutes);
+    app.use('/api/robot', missionRoutes);
+    app.use('/uploads', express.static(uploadDir));
+
+    // Endpoints pour les cartes
+    app.get('/map_live.png', (req, res) => {
+      const filePath = join(__dirname, 'map_live.png');
+      if (fs.existsSync(filePath)) {
+        res.sendFile(filePath);
+      } else {
+        res.status(404).json({ message: 'Fichier non trouvé' });
+      }
+    });
+
+    app.get('/mission_map.png', (req, res) => {
+      const filePath = join(__dirname, 'mission_map.png');
+      if (fs.existsSync(filePath)) {
+        res.sendFile(filePath);
+      } else {
+        res.status(404).json({ message: 'Carte de mission non trouvée' });
+      }
+    });
+
+    // API pour récupérer l'état courant
+    app.get('/api/current_state', (req, res) => {
+      res.json({
+        robotPosition: currentRobotPosition,
+        trajectory: currentTrajectory,
+        activeMissions: Array.from(activeMissions.entries())
+      });
+    });
+
+    // Tâche périodique
+    setInterval(() => {
+      console.log('🔄 Mise à jour du statut des robots');
+      updateRobotStatus();
+    }, 3000);
+
+    // Gestion des erreurs
+    app.use((err, req, res, next) => {
+      console.error('❌ Erreur serveur:', err.stack);
+      res.status(500).json({ message: 'Erreur interne du serveur' });
+    });
+
+    // Démarrage du serveur
+    server.listen(port, () => {
+      console.log(`✅ Serveur HTTP sur http://localhost:${port}`);
+      console.log(`✅ Serveur WebSocket sur ws://localhost:${port}`);
+    });
+  } catch (err) {
+    console.error('❌ Échec du démarrage du serveur:', err);
+    process.exit(1);
   }
-});
+};
 
-// Routes de l'API
-app.use('/api/user', userRoutes);
+// Fonctions utilitaires
+async function updateMapWithTrajectory(mapData, robotPosition, trajectory) {
+  try {
+    await convertMapToPGMMission(mapData, 'mission_map.pgm', robotPosition, trajectory);
+    await convertPGMtoPNGMission('mission_map.pgm', 'mission_map.png');
+    console.log('🗺️ Carte mise à jour avec la trajectoire');
+  } catch (error) {
+    console.error('❌ Erreur mise à jour carte:', error);
+  }
+}
 
-app.use('/api/robot', robotRoutes);
-app.use('/api/map', mapRoutes);
-app.use('/api', moveRoutes);
+function broadcastMapUpdate() {
+  const updateMessage = JSON.stringify({
+    type: 'map_update',
+    data: { 
+      url: '/mission_map.png',
+      timestamp: Date.now(),
+      trajectory: currentTrajectory
+    }
+  });
 
-app.use('/api', slamRoutes);
-app.use('', imageRoutes);
-app.use('/uploads', express.static(uploadDir));
+  wss.clients.forEach(client => {
+    if (client.readyState === WebSocket.OPEN) {
+      client.send(updateMessage);
+    }
+  });
+}
 
-// Gestion des erreurs globales
-app.use((err, req, res, next) => {
-  console.error(err.stack);
-  res.status(500).json({ message: 'Something went wrong!' });
-});
-
-// Démarrer le serveur
-app.listen(port, () => console.log(`Server running on http://localhost:${port}`));
+startServer();
